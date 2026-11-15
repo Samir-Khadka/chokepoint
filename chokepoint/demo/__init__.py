@@ -131,3 +131,22 @@ def load_demo_inventory() -> Inventory:
             for d in raw.get("db_instances", [])
         ],
     )
+
+
+def demo_terraform_dir() -> Path:
+    """Directory holding the demo Terraform fixture."""
+    return Path(__file__).with_name("terraform")
+
+
+def load_demo_terraform() -> tuple[str, dict]:
+    """The demo Terraform fixture: (main.tf text, tfstate data).
+
+    The fixture mirrors :func:`load_demo_inventory` resource for
+    resource — same ids, same policies, same public access — so a
+    fix generated against it applies to the same account the demo
+    graph describes.
+    """
+    tf_dir = demo_terraform_dir()
+    main_tf = (tf_dir / "main.tf").read_text()
+    state = json.loads((tf_dir / "terraform.tfstate").read_text())
+    return main_tf, state

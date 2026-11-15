@@ -1,13 +1,15 @@
-# Chokepoint — Phase 3
+# Chokepoint — Phase 4
 
 **Attack-path fixing instead of vulnerability lists.**
 
-Phases 1–3 are done. Phase 1 built the foundation: a read-only
+Phases 1–4 are done. Phase 1 built the foundation: a read-only
 AWS collector, a Postgres-first graph, and path finding for the two
 launch patterns. Phase 3 ranks the fixes: it answers *which five
-fixes remove the most real attack paths to what matters?* Fix
-generation (templates, Terraform PRs) is Phase 4 — deliberately
-not here.
+fixes remove the most real attack paths to what matters?* Phase 4
+generates the fix: a template turns the top-ranked fix into a
+Terraform change plus a review-ready PR body — validated by
+re-running path finding before anything is emitted. Opening a real
+PR against a repo is the next step, not this build.
 
 Full product plan: the Chokepoint Plan document (November 2026) — the
 13-page plan behind this build.
@@ -37,6 +39,67 @@ Full product plan: the Chokepoint Plan document (November 2026) — the
   and says so: a human must review it before anything changes.
   A fix here is a graph-level removal, **not** a validated
   Terraform change — that is Phase 4.
+
+## What Phase 4 does
+
+- **Terraform state parser** (`chokepoint/terraform/`) — parses
+  `.tfstate` JSON (resources, addresses, attributes) and maps
+  resource addresses to graph node ids, plus a minimal `.tf`
+  config reader that locates a resource block by address and does
+  brace-matched surgery on it. It is a fixture-scoped reader, not
+  a general HCL parser: no variables, modules, `for_each`, or
+  computed values.
+- **Demo Terraform fixture** (`chokepoint/demo/terraform/`) —
+  `main.tf` + `terraform.tfstate` that mirror the demo account
+  1:1 (public EC2 web server, web-role and its policies,
+  admin-role, customer-data + backups buckets, prod-db RDS,
+  security groups). 39 resources; every demo resource maps to
+  its graph node id. The fixture's only credential is the
+  placeholder string `placeholder-credential-not-real`.
+- **Template-based fix generation** (`chokepoint/fixes/`,
+  **no LLM anywhere**) — six templates, chosen by candidate kind
+  and edge kind: detach a role from an instance, narrow (or
+  remove) an over-broad policy statement, close public
+  security-group ingress, make a workload private, remove a
+  trust-policy principal, make an S3 bucket private, remove a
+  stored credential object. Each template takes a ranked fix +
+  the fixture and returns the full modified `.tf`, a unified
+  diff, and the resource addresses changed. A template's graph
+  effect is declared from the change itself — narrowing a policy
+  removes only the edges that statement granted — not copied
+  from the ranking, so the PR body reports measured numbers and
+  says so when they differ from the ranked estimate (fix #2
+  measures 4 → 2 paths; the ranked estimate was 3 removed).
+- **Mandatory before/after validation** — the fix is applied to
+  a copy of the in-memory graph using the same exclusion
+  mechanism as the ranking module, path finding is re-run, and
+  the fix is emitted only if it removes paths **and** introduces
+  none. A fix that does not reduce paths is refused with an
+  error and **no output files are written**. The record reports
+  before/after counts and exactly which paths disappeared.
+- **PR body generator** — markdown with a title, a
+  plain-language summary, the fix with its diff, before/after
+  path counts and the removed paths, what could break, a
+  validation statement, a re-scan verification plan, and a
+  "review before merging" note. Chokepoint never merges its own
+  PRs.
+- **CLI** — `chokepoint fix --demo [--fix N] [--out-dir DIR]`
+  picks the Nth ranked fix (default 1) and writes `main.tf`,
+  `pr-body.md`, and `validation.json` into `fixes/<fix-id>/`
+  (or `--out-dir`). The generator only writes files; it never
+  applies changes to real infrastructure, and there is no
+  `--apply` flag in this phase.
+
+**Limits (Phase 4, honest):** templates assume the fixture's
+known structure (resource naming, `jsonencode` policies, one
+policy per statement list); general-purpose HCL editing is future
+work. Fixes are generated for the demo fixture only — a real
+account has no `.tf` to edit yet, so `fix` requires `--demo`.
+Opening a real PR against a repo is the next step, not this
+build. Some ranked fixes have no template (a role whose policies
+are already scoped; a bucket that is already private) — those
+are refused cleanly, with no files written, rather than
+generating a no-op change.
 
 ## What Phase 1 does (foundation, unchanged)
 
@@ -101,6 +164,23 @@ betweenness 11.0), and the minimum disconnecting set is **2 fixes**
 disconnecting all 4 paths (detach the role, then make
 `s3://customer-data` private).
 
+Generate the Terraform fix for the top-ranked fix, with its PR
+body and validation record:
+
+```bash
+.venv/bin/python -m chokepoint fix --demo
+.venv/bin/python -m chokepoint fix --demo --fix 2 --out-dir /tmp/fix2
+```
+
+Expected output: fix #1 takes the demo from **4 paths to 1**
+(3 removed, 0 new) and writes `main.tf`, `pr-body.md`, and
+`validation.json` into `fixes/edge-ec2-i-web00001-iam-role-web-role-has_role/`.
+The generated diff is one line — the `iam_instance_profile`
+removed from `aws_instance.web`. Fix #2 narrows the over-broad
+policy statement to `s3://assets` and takes the demo from 4
+paths to 2, with a note that the ranked estimate was 3 removed.
+Nothing is applied to real infrastructure.
+
 The demo account is hand-built so its paths are known exactly
 (`chokepoint/demo/inventory.json`): a public EC2 whose
 over-permissioned role can read a backups bucket holding the prod
@@ -134,7 +214,7 @@ of memory:
 .venv/bin/python -m pytest
 ```
 
-60 tests, all passing (1 skipped: the live-Postgres round-trip,
+126 tests, all passing (1 skipped: the live-Postgres round-trip,
 which needs `CHOKEPOINT_TEST_DSN` pointing at a test database —
 no Postgres is installed in this environment). Coverage:
 
@@ -152,6 +232,18 @@ no Postgres is installed in this environment). Coverage:
   hand computation (web-role node 9.0, ec2→web-role edge 11.0), a
   decoy-only candidate scores 0 and never ranks, ranking is
   deterministic, CLI text and JSON output shapes.
+- Phase 4: the state parser maps every demo resource in the
+  fixture tfstate; the config reader locates blocks and does
+  brace-matched surgery; each template produces a modified `.tf`
+  that still parses (python-hcl2, a dev dependency) with the
+  expected change, pinned by golden files in `tests/golden/`
+  (one per template kind — a template change is a deliberate
+  golden update); validation takes the demo from 4 paths to 1
+  for the top fix, refuses a no-op fix and a fix that would add
+  paths, and reports measured vs ranked counts; CLI end-to-end
+  in demo mode for fix #1 and fix #2 (files written, PR body
+  contains the before/after numbers); generation is
+  deterministic.
 - CLI end-to-end in demo mode (text and JSON).
 
 ## Architecture
@@ -179,7 +271,16 @@ chokepoint/
                 ranking.py (score by paths removed, rank Top 5,
                   greedy disconnecting set)
   demo/         inventory.json + loader
-  cli.py        scan / list-paths / top-fixes
+                terraform/ (main.tf + terraform.tfstate mirroring
+                  inventory.json 1:1)
+  terraform/    state.py   (tfstate JSON parser, address -> node id)
+                config.py  (minimal .tf block reader + span surgery)
+  fixes/        _hcl.py    (jsonencode/heredoc policy helpers)
+                templates.py (template selection + application)
+                validation.py (before/after re-run, refuse rule)
+                generate.py (pipeline: template -> validate -> diff)
+                prbody.py  (review-ready PR body markdown)
+  cli.py        scan / list-paths / top-fixes / fix
 ```
 
 Design choices worth knowing:
@@ -212,7 +313,10 @@ Design choices worth knowing:
 - No active exploitation, no credential use, no lateral movement.
   Analysis only.
 - Demo mode uses no credentials and no network.
-- No LLM anywhere in this phase. Fix generation is Phase 4.
+- No LLM anywhere. Fix generation is template-based (Phase 4);
+  an LLM is a later phase, if ever.
+- The fix generator only writes files. It never applies a change
+  to real infrastructure, and there is no `--apply` flag.
 
 ## Explicitly NOT in this phase
 
@@ -220,10 +324,16 @@ Per the plan, deferred — do not mistake absence for oversight:
 
 - **P3 instance-metadata chains** (IMDSv1 / SSRF → temporary
   credentials) — fast follow after P1/P2 accuracy is proven.
-- **Fix generation and Terraform PRs** (Phase 4), web UI, GitHub App.
-- **Terraform-state parser** — listed in the plan's Phase 1, but
-  out of this build's scope; the fix generator (Phase 4) is what
-  needs to write back into Terraform, so the parser lands with it.
+- **Opening a real PR against a repo** — Phase 4 generates the
+  `.tf` change, the PR body, and the validation record; pushing
+  them to a repo as a pull request is the next step.
+- **General-purpose HCL editing** — the templates are
+  fixture-scoped (known resource naming, `jsonencode` policies);
+  variables, modules, `for_each`, and computed values are future
+  work.
+- **Fix generation for real accounts** — `fix` is demo-fixture
+  only in this phase; a real account has no `.tf` to edit yet.
+- Web UI, GitHub App.
 - **Multi-cloud, Kubernetes, CI/CD and code graphs, SaaS.**
 - ALB / load-balancer entry points (NetworkEntry nodes are ready
   for them).
