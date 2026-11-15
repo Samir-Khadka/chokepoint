@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chokepoint"
+version = "0.1.0"
+description = "Attack-path fixing instead of vulnerability lists (Phase 1: read-only AWS collector + graph + P1/P2 path finding)"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.34",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+dev = ["pytest>=8", "chokepoint[postgres]"]
+
+[project.scripts]
+chokepoint = "chokepoint.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["chokepoint*"]
+
+[tool.setuptools.package-data]
+chokepoint = ["demo/inventory.json", "graph/schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
