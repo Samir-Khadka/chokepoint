@@ -29,6 +29,24 @@ from .graph.model import Node
 from .graph.postgres import PostgresGraphStore
 from .paths.crown_jewels import suggest_crown_jewels
 from .paths.patterns import choke_point, find_paths, paths_through
+from .ranking import rank_fixes
+
+
+def _add_scan_args(p):
+    p.add_argument("--demo", action="store_true",
+                   help="use the bundled demo account (no credentials)")
+    p.add_argument("--region", default="us-east-1",
+                   help="AWS region to scan (default: us-east-1)")
+    p.add_argument("--profile", default=None,
+                   help="AWS profile name for a real scan")
+    p.add_argument("--postgres", default=None, metavar="DSN",
+                   help="store the graph in Postgres instead of memory")
+    p.add_argument("--crown-jewel", action="append", default=[],
+                   metavar="NODE-ID",
+                   help="tag a node id as a crown jewel (repeatable)")
+    p.add_argument("--max-depth", type=int, default=8,
+                   help="max path length in hops (default: 8)")
+    p.add_argument("--output", choices=("text", "json"), default="text")
 
 
 def _build_store(args):
@@ -104,7 +122,8 @@ def _render_text(inventory, report, jewel_ids, paths) -> str:
     if cp:
         lines.append(
             f"\nTop choke point: {cp.label} — {paths_through(paths, cp.id)} of "
-            f"{len(paths)} paths pass through it. (Full ranking is Phase 3.)"
+            f"{len(paths)} paths pass through it. "
+            "(See `top-fixes` for the ranked fix list.)"
         )
     if report.unknown_edges:
         lines.append("\nUnknown-confidence edges (shown for transparency, not used):")
@@ -146,29 +165,126 @@ def _render_json(inventory, report, jewel_ids, paths) -> str:
     )
 
 
+def _render_top_fixes_text(inventory, jewel_ids, paths, ranking) -> str:
+    lines = [
+        f"Chokepoint top fixes — account {inventory.account_id or '(demo)'} "
+        f"region {inventory.region}",
+        f"{ranking.total_paths} attack path(s) to {len(jewel_ids)} crown jewel(s). "
+        "Fixes are graph-level removals, not validated Terraform changes "
+        "(Phase 4). Review before changing anything.",
+        "",
+    ]
+    if ranking.total_paths == 0:
+        lines.append("No attack paths found — nothing to rank.")
+        return "\n".join(lines)
+    lines.append(
+        "Top fixes (ranked by paths removed, then path-graph betweenness):"
+    )
+    for i, fix in enumerate(ranking.top_fixes, 1):
+        cand = fix.candidate
+        lines.append(
+            f"\n[{i}] {cand.title} — removes {fix.paths_removed} of "
+            f"{ranking.total_paths} path(s)"
+        )
+        if fix.crown_jewels_protected:
+            lines.append(
+                "    Protects: "
+                + ", ".join(fix.crown_jewels_protected)
+                + " (every path to it is removed)"
+            )
+        lines.append(f"    Why: {cand.explanation}")
+        for ev in cand.evidence:
+            lines.append(f"    Evidence: {ev}")
+        lines.append(f"    What could break: {cand.what_could_break}")
+    chosen = ranking.disconnecting_set
+    if ranking.disconnects_all:
+        lines.append(
+            f"\nMinimum disconnecting set (greedy approximation, not an "
+            f"exact minimum cut): {len(chosen)} fix(es) disconnect all "
+            f"{ranking.total_paths} paths:"
+        )
+    else:
+        lines.append(
+            f"\nNo full disconnecting set found: {len(chosen)} fix(es) "
+            f"disconnect some, but not all, of the "
+            f"{ranking.total_paths} paths:"
+        )
+    for i, fix in enumerate(chosen, 1):
+        lines.append(
+            f"  {i}. {fix.candidate.title} "
+            f"(removes {fix.paths_removed} path(s))"
+        )
+    return "\n".join(lines)
+
+
+def _render_top_fixes_json(inventory, jewel_ids, paths, ranking) -> str:
+    def _fix_dict(rank, fix):
+        cand = fix.candidate
+        return {
+            "rank": rank,
+            "id": cand.id,
+            "kind": cand.kind,
+            "title": cand.title,
+            "explanation": cand.explanation,
+            "evidence": list(cand.evidence),
+            "what_could_break": cand.what_could_break,
+            "paths_removed": fix.paths_removed,
+            "paths_remaining": ranking.total_paths - fix.paths_removed,
+            "crown_jewels_protected": list(fix.crown_jewels_protected),
+            "betweenness": fix.betweenness,
+            "removed_paths": [
+                {"pattern": paths[i].pattern,
+                 "crown_jewel": paths[i].crown_jewel.id}
+                for i in fix.removed_path_indexes
+            ],
+        }
+
+    return json.dumps(
+        {
+            "account": inventory.account_id,
+            "region": inventory.region,
+            "total_paths": ranking.total_paths,
+            "crown_jewels": jewel_ids,
+            "top_fixes": [
+                _fix_dict(i, fix)
+                for i, fix in enumerate(ranking.top_fixes, 1)
+            ],
+            "minimum_disconnecting_set": {
+                "count": len(ranking.disconnecting_set),
+                "disconnects_all": ranking.disconnects_all,
+                "fixes": [
+                    {
+                        "id": fix.candidate.id,
+                        "title": fix.candidate.title,
+                        "paths_removed": fix.paths_removed,
+                    }
+                    for fix in ranking.disconnecting_set
+                ],
+            },
+        },
+        indent=2,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="chokepoint",
-        description="Chokepoint Phase 1: read-only AWS attack-path finder (P1/P2).",
+        description="Chokepoint: read-only AWS attack-path finder — "
+                    "scan, list paths, rank choke-point fixes (Phase 3).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name in ("scan", "list-paths"):
         p = sub.add_parser(name, help="scan an account and find P1/P2 paths")
-        p.add_argument("--demo", action="store_true",
-                       help="use the bundled demo account (no credentials)")
-        p.add_argument("--region", default="us-east-1",
-                       help="AWS region to scan (default: us-east-1)")
-        p.add_argument("--profile", default=None,
-                       help="AWS profile name for a real scan")
-        p.add_argument("--postgres", default=None, metavar="DSN",
-                       help="store the graph in Postgres instead of memory")
-        p.add_argument("--crown-jewel", action="append", default=[],
-                       metavar="NODE-ID",
-                       help="tag a node id as a crown jewel (repeatable)")
-        p.add_argument("--max-depth", type=int, default=8,
-                       help="max path length in hops (default: 8)")
-        p.add_argument("--output", choices=("text", "json"), default="text")
+        _add_scan_args(p)
+
+    p = sub.add_parser(
+        "top-fixes",
+        help="rank the top choke-point fixes by paths removed",
+    )
+    _add_scan_args(p)
+    p.add_argument("--top", type=int, default=5,
+                   help="how many top fixes to show (default: 5)")
 
     args = parser.parse_args(argv)
     if not args.demo and not args.profile and not _aws_credentials_configured():
@@ -179,6 +295,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     inventory, store, report, jewel_ids, paths = _run(args)
+    if args.command == "top-fixes":
+        ranking = rank_fixes(store, paths, top=args.top,
+                             max_depth=args.max_depth)
+        if args.output == "json":
+            print(_render_top_fixes_json(inventory, jewel_ids, paths, ranking))
+        else:
+            print(_render_top_fixes_text(inventory, jewel_ids, paths, ranking))
+        return 0
     if args.command == "list-paths":
         if args.output == "json":
             print(_render_json(inventory, report, jewel_ids, paths))

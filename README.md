@@ -1,17 +1,44 @@
-# Chokepoint — Phase 1
+# Chokepoint — Phase 3
 
 **Attack-path fixing instead of vulnerability lists.**
 
-Phase 1 builds the foundation the plan calls for: a read-only AWS
-collector, a Postgres-first graph, and path finding for the two
-launch patterns. It answers one question: *which routes exist from
-the public Internet to what matters?* Fix generation (templates,
-Terraform PRs) is Phase 4 — deliberately not here.
+Phases 1–3 are done. Phase 1 built the foundation: a read-only
+AWS collector, a Postgres-first graph, and path finding for the two
+launch patterns. Phase 3 ranks the fixes: it answers *which five
+fixes remove the most real attack paths to what matters?* Fix
+generation (templates, Terraform PRs) is Phase 4 — deliberately
+not here.
 
 Full product plan: the Chokepoint Plan document (November 2026) — the
 13-page plan behind this build.
 
-## What Phase 1 does
+## What Phase 3 does
+
+- **Enumerate candidate fixes** — every edge on at least one
+  attack path (cut that edge) and every non-entry, non-crown-jewel
+  node on at least one path (remove that node and its incident
+  edges). The Internet and crown jewels are never candidates.
+- **Score by paths removed** — measured, not estimated: the path
+  search is re-run with the candidate applied and the paths that
+  disappear are counted. Only proven-confidence edges are scored.
+- **Rank the Top 5** — by paths removed (descending), with
+  path-graph betweenness centrality (Brandes, directed, over the
+  subgraph induced by the attack paths) as the tiebreak, then
+  candidate id for a fully deterministic order.
+- **Minimum disconnecting set** — greedy set cover: repeatedly
+  pick the fix removing the most still-uncovered paths until every
+  path is disconnected. Reported as "N fixes disconnect all M
+  paths". Greedy is an approximation of a minimum cut, not exact,
+  and it is labelled as such.
+- **Plain-language fixes** — each candidate carries a title, an
+  explanation, the evidence behind it (which policy statement,
+  rule, or attachment), and a "what could break" note. The
+  blast-radius note is a heuristic from the graph evidence only
+  and says so: a human must review it before anything changes.
+  A fix here is a graph-level removal, **not** a validated
+  Terraform change — that is Phase 4.
+
+## What Phase 1 does (foundation, unchanged)
 
 - **Collect** — read-only boto3 collectors for EC2 instances,
   security groups, route tables, S3 buckets (+ policies, ACLs,
@@ -33,10 +60,6 @@ Full product plan: the Chokepoint Plan document (November 2026) — the
 - **Tag crown jewels** — from tags (`crown-jewel=true`,
   `Environment=production` RDS, `sensitivity=customer-data` S3,
   `admin=true` roles) or explicit `--crown-jewel <node-id>`.
-- **Demo mode** — a bundled mock account runs end-to-end with zero
-  credentials and prints the found paths with the choke point
-  marked (the node the most paths pass through; full ranking is
-  Phase 3).
 
 ## Setup
 
@@ -63,6 +86,20 @@ paths pass through it). Machine-readable output:
 ```bash
 .venv/bin/python -m chokepoint list-paths --demo --output json
 ```
+
+The ranked fixes:
+
+```bash
+.venv/bin/python -m chokepoint top-fixes --demo
+.venv/bin/python -m chokepoint top-fixes --demo --output json
+.venv/bin/python -m chokepoint top-fixes --demo --top 3
+```
+
+Expected output: the top fix is **"Detach role/web-role from
+ec2:i-web00001"** (removes 3 of 4 paths, protects `rds:prod-db`,
+betweenness 11.0), and the minimum disconnecting set is **2 fixes**
+disconnecting all 4 paths (detach the role, then make
+`s3://customer-data` private).
 
 The demo account is hand-built so its paths are known exactly
 (`chokepoint/demo/inventory.json`): a public EC2 whose
@@ -97,7 +134,7 @@ of memory:
 .venv/bin/python -m pytest
 ```
 
-46 tests, all passing (1 skipped: the live-Postgres round-trip,
+60 tests, all passing (1 skipped: the live-Postgres round-trip,
 which needs `CHOKEPOINT_TEST_DSN` pointing at a test database —
 no Postgres is installed in this environment). Coverage:
 
@@ -110,6 +147,11 @@ no Postgres is installed in this environment). Coverage:
 - Graph builder + path finding on the demo account: exactly the 4
   planted paths, zero invented paths, decoys in none of them,
   unknown edges never followed.
+- Ranking: top fix removes 3 paths and involves web-role, greedy
+  set disconnects all 4 paths with 2 fixes, betweenness matches a
+  hand computation (web-role node 9.0, ec2→web-role edge 11.0), a
+  decoy-only candidate scores 0 and never ranks, ranking is
+  deterministic, CLI text and JSON output shapes.
 - CLI end-to-end in demo mode (text and JSON).
 
 ## Architecture
@@ -128,9 +170,16 @@ chokepoint/
                 iam_eval.py (narrow policy evaluator + role_can)
                 builder.py (Inventory -> graph edges)
   paths/        crown_jewels.py (tag suggestions)
-                patterns.py (P1/P2 DFS, choke-point count)
+                patterns.py (P1/P2 DFS, choke-point count; Phase 3
+                  exclusion params to simulate a fix)
+  ranking/      candidates.py (edge/node fix enumeration, titles,
+                  explanations, evidence, what-could-break)
+                centrality.py (Brandes node + edge betweenness on
+                  the path subgraph)
+                ranking.py (score by paths removed, rank Top 5,
+                  greedy disconnecting set)
   demo/         inventory.json + loader
-  cli.py        scan / list-paths
+  cli.py        scan / list-paths / top-fixes
 ```
 
 Design choices worth knowing:
@@ -171,8 +220,7 @@ Per the plan, deferred — do not mistake absence for oversight:
 
 - **P3 instance-metadata chains** (IMDSv1 / SSRF → temporary
   credentials) — fast follow after P1/P2 accuracy is proven.
-- **Fix generation and Terraform PRs** (Phase 4), choke-point
-  ranking / Top-5 list (Phase 3), web UI, GitHub App.
+- **Fix generation and Terraform PRs** (Phase 4), web UI, GitHub App.
 - **Terraform-state parser** — listed in the plan's Phase 1, but
   out of this build's scope; the fix generator (Phase 4) is what
   needs to write back into Terraform, so the parser lands with it.
