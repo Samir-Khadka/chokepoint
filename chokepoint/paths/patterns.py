@@ -49,14 +49,28 @@ def classify_pattern(first_edge: Edge, first_node: Node) -> str:
     return "P1"
 
 
-def find_paths(store: GraphStore, max_depth: int = 8) -> list[Path]:
-    """Enumerate all proven paths from the Internet to crown jewels."""
+def find_paths(
+    store: GraphStore,
+    max_depth: int = 8,
+    exclude_edges: set[tuple[str, str, str]] | None = None,
+    exclude_nodes: set[str] | None = None,
+) -> list[Path]:
+    """Enumerate all proven paths from the Internet to crown jewels.
+
+    ``exclude_edges`` / ``exclude_nodes`` simulate a fix: paths that
+    would use a removed edge, or pass through a removed node, are
+    not returned. The ranking module (Phase 3) scores a candidate
+    fix by re-running this search with the candidate applied — the
+    store itself is never mutated.
+    """
     internet = store.get_node("internet")
     if internet is None:
         return []
     crown_ids = {n.id for n in store.nodes() if n.crown_jewel}
     if not crown_ids:
         return []
+    excluded_edges = set(exclude_edges or ())
+    excluded_nodes = set(exclude_nodes or ())
 
     found: list[Path] = []
 
@@ -66,8 +80,12 @@ def find_paths(store: GraphStore, max_depth: int = 8) -> list[Path]:
         for edge in store.outgoing(node.id):
             if edge.confidence is not Confidence.PROVEN:
                 continue
+            if (edge.source, edge.target, edge.kind.value) in excluded_edges:
+                continue
             target = store.get_node(edge.target)
             if target is None or target in path_nodes:
+                continue
+            if target.id in excluded_nodes:
                 continue
             new_nodes = path_nodes + [target]
             new_edges = path_edges + [edge]
