@@ -3,16 +3,23 @@
 Commands:
   scan        collect (or load --demo), build the graph, find paths
   list-paths  same as scan, but print only the paths
+  top-fixes   rank the top choke-point fixes by paths removed (Phase 3)
+  fix         generate a validated Terraform fix + PR body (Phase 4)
 
 Read-only by design: ``scan`` against real AWS uses the read-only
 guard (``collectors.aws``) and a least-privilege read-only role.
-``--demo`` needs no credentials at all.
+``--demo`` needs no credentials at all. ``fix`` only writes files
+into an output directory; it never applies a change to real
+infrastructure and there is no ``--apply`` flag.
 
 Examples:
   python -m chokepoint scan --demo
   python -m chokepoint scan --demo --output json
   python -m chokepoint scan --region us-east-1 --profile my-ro
   python -m chokepoint scan --demo --postgres postgresql://localhost/chokepoint
+  python -m chokepoint top-fixes --demo
+  python -m chokepoint fix --demo
+  python -m chokepoint fix --demo --fix 2 --out-dir fixes/my-fix
 """
 
 from __future__ import annotations
@@ -20,9 +27,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from .collectors import scan_account
-from .demo import load_demo_inventory
+from .demo import load_demo_inventory, load_demo_terraform
+from .fixes import FixRejected, generate_fix, render_pr_body
 from .graph.builder import build_graph
 from .graph.memory import InMemoryGraphStore
 from .graph.model import Node
@@ -30,6 +39,7 @@ from .graph.postgres import PostgresGraphStore
 from .paths.crown_jewels import suggest_crown_jewels
 from .paths.patterns import choke_point, find_paths, paths_through
 from .ranking import rank_fixes
+from .terraform import parse_state
 
 
 def _add_scan_args(p):
@@ -170,8 +180,8 @@ def _render_top_fixes_text(inventory, jewel_ids, paths, ranking) -> str:
         f"Chokepoint top fixes — account {inventory.account_id or '(demo)'} "
         f"region {inventory.region}",
         f"{ranking.total_paths} attack path(s) to {len(jewel_ids)} crown jewel(s). "
-        "Fixes are graph-level removals, not validated Terraform changes "
-        "(Phase 4). Review before changing anything.",
+        "Use `chokepoint fix` to generate a validated Terraform change for "
+        "one of these fixes. Review before changing anything.",
         "",
     ]
     if ranking.total_paths == 0:
@@ -266,11 +276,121 @@ def _render_top_fixes_json(inventory, jewel_ids, paths, ranking) -> str:
     )
 
 
+def _write_fix_files(out_dir: Path, generated, pr_body: str) -> dict:
+    """Write main.tf, pr-body.md and validation.json for a fix."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    validation = generated.validation
+    (out_dir / "main.tf").write_text(generated.new_tf_text)
+    (out_dir / "pr-body.md").write_text(pr_body)
+    record = {
+        "fix_id": generated.fix_id,
+        "title": generated.candidate.title,
+        "template": generated.template_name,
+        "changed_addresses": list(generated.changed_addresses),
+        "summary": generated.summary,
+        "ranked_paths_removed": generated.ranked_paths_removed,
+        "measured_paths_removed": generated.measured_paths_removed,
+        "note": generated.note,
+        "valid": validation.valid,
+        "validation": validation.reason,
+        "before_paths": validation.before_count,
+        "after_paths": validation.after_count,
+        "paths_removed": validation.paths_removed,
+        "removed_paths": [
+            {
+                "pattern": path.pattern,
+                "crown_jewel": path.crown_jewel.id,
+                "chain": path.render(),
+            }
+            for path in validation.removed_paths
+        ],
+        "new_paths": [
+            {"pattern": path.pattern, "crown_jewel": path.crown_jewel.id}
+            for path in validation.new_paths
+        ],
+        "crown_jewels_protected": sorted(
+            {p.crown_jewel.id for p in validation.removed_paths}
+        ),
+    }
+    (out_dir / "validation.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def _run_fix(args) -> int:
+    """`chokepoint fix`: generate a validated Terraform fix.
+
+    Demo fixture only in this phase: the templates edit the
+    bundled fixture, so a real account has no .tf to edit yet.
+    Files are written only after validation passes; a refused fix
+    writes nothing and exits non-zero.
+    """
+    if not args.demo:
+        print(
+            "fix generation in this phase works on the demo fixture "
+            "only — run with --demo.",
+            file=sys.stderr,
+        )
+        return 2
+    inventory, store, report, jewel_ids, paths = _run(args)
+    ranking = rank_fixes(store, paths, top=args.top, max_depth=args.max_depth)
+    if ranking.total_paths == 0:
+        print("No attack paths found — nothing to fix.")
+        return 0
+    if args.fix < 1 or args.fix > len(ranking.top_fixes):
+        print(
+            f"--fix {args.fix} is out of range: ranked fixes are "
+            f"1..{len(ranking.top_fixes)} "
+            f"(use --top to rank more).",
+            file=sys.stderr,
+        )
+        return 2
+    scored = ranking.top_fixes[args.fix - 1]
+    main_tf, state_data = load_demo_terraform()
+    state = parse_state(state_data)
+    try:
+        generated = generate_fix(
+            scored.candidate,
+            store,
+            paths,
+            main_tf,
+            state,
+            max_depth=args.max_depth,
+            scored=scored,
+        )
+    except (FixRejected, ValueError) as exc:
+        print(f"Cannot generate this fix: {exc}", file=sys.stderr)
+        return 1
+    pr_body = render_pr_body(generated, inventory.account_id or "")
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else Path("fixes") / generated.fix_id
+    )
+    _write_fix_files(out_dir, generated, pr_body)
+    validation = generated.validation
+    print(
+        f"Fix #{args.fix}: {generated.candidate.title}\n"
+        f"  Template: {generated.template_name} "
+        f"({generated.summary})\n"
+        f"  Attack paths: {validation.before_count} -> "
+        f"{validation.after_count} "
+        f"({validation.paths_removed} removed, "
+        f"{len(validation.new_paths)} new)\n"
+        f"  Files written to {out_dir}/: main.tf, pr-body.md, "
+        "validation.json\n"
+        "  Nothing was applied to real infrastructure."
+    )
+    if generated.note:
+        print(f"  {generated.note}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="chokepoint",
         description="Chokepoint: read-only AWS attack-path finder — "
-                    "scan, list paths, rank choke-point fixes (Phase 3).",
+                    "scan, list paths, rank choke-point fixes (Phase 3), "
+                    "generate Terraform fixes (Phase 4).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -286,7 +406,33 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--top", type=int, default=5,
                    help="how many top fixes to show (default: 5)")
 
+    p = sub.add_parser(
+        "fix",
+        help="generate a validated Terraform fix + PR body (demo only)",
+    )
+    p.add_argument("--demo", action="store_true",
+                   help="use the bundled demo account (required)")
+    p.add_argument("--fix", type=int, default=1,
+                   help="which ranked fix to generate (1-based, default: 1)")
+    p.add_argument("--top", type=int, default=5,
+                   help="how many fixes to rank (default: 5)")
+    p.add_argument("--out-dir", default=None, metavar="DIR",
+                   help="write files here (default: fixes/<fix-id>/)")
+    p.add_argument("--region", default="us-east-1",
+                   help="AWS region to scan (default: us-east-1)")
+    p.add_argument("--profile", default=None,
+                   help="AWS profile name for a real scan")
+    p.add_argument("--postgres", default=None, metavar="DSN",
+                   help="store the graph in Postgres instead of memory")
+    p.add_argument("--max-depth", type=int, default=8,
+                   help="max path length in hops (default: 8)")
+    p.add_argument("--crown-jewel", action="append", default=[],
+                   metavar="NODE-ID",
+                   help="tag a node id as a crown jewel (repeatable)")
+
     args = parser.parse_args(argv)
+    if args.command == "fix":
+        return _run_fix(args)
     if not args.demo and not args.profile and not _aws_credentials_configured():
         print(
             "No AWS credentials found and --demo not given. "

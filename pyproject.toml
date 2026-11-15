@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chokepoint"
 version = "0.1.0"
-description = "Attack-path fixing instead of vulnerability lists (Phase 1: read-only AWS collector + graph + P1/P2 path finding)"
+description = "Attack-path fixing instead of vulnerability lists (Phases 1-4: read-only AWS collector + graph + P1/P2 path finding + fix ranking + Terraform fix generation)"
 requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.34",
@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
-dev = ["pytest>=8", "chokepoint[postgres]"]
+dev = ["pytest>=8", "python-hcl2>=8", "chokepoint[postgres]"]
 
 [project.scripts]
 chokepoint = "chokepoint.cli:main"
@@ -22,7 +22,12 @@ chokepoint = "chokepoint.cli:main"
 include = ["chokepoint*"]
 
 [tool.setuptools.package-data]
-chokepoint = ["demo/inventory.json", "graph/schema.sql"]
+chokepoint = [
+    "demo/inventory.json",
+    "demo/terraform/main.tf",
+    "demo/terraform/terraform.tfstate",
+    "graph/schema.sql",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
